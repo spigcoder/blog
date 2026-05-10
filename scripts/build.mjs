@@ -14,6 +14,7 @@ const site = {
   title: "技术笔记",
   description: "一个简洁、快速、面向长期写作的个人技术博客。",
   motto: "保持前进的姿态，比写出完美的代码重要10000倍",
+  logo: "/assets/programmer-logo.svg",
   defaultCover: "/assets/cover.png",
   categories: [
     {
@@ -465,12 +466,14 @@ function layout({ title, description, body }) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)} · ${escapeHtml(site.title)}</title>
   <meta name="description" content="${escapeHtml(description || site.description)}">
+  <link rel="icon" href="${site.logo}" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="${site.logo}">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header class="site-header">
     <nav class="nav">
-      <a class="brand" href="/">${escapeHtml(site.title)}</a>
+      <a class="brand" href="/"><img class="brand-logo" src="${site.logo}" alt="" width="32" height="32">${escapeHtml(site.title)}</a>
       <div class="nav-links">
         ${categoryLinks}
       </div>

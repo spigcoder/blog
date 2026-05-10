@@ -62,13 +62,12 @@ a {
   letter-spacing: 0;
 }
 
-.brand::before {
-  content: "";
-  width: 9px;
-  height: 28px;
-  border-radius: 999px;
-  background: var(--accent);
-  box-shadow: 0 10px 24px rgba(185, 71, 47, 0.28);
+.brand-logo {
+  width: 34px;
+  height: 34px;
+  display: block;
+  border-radius: 10px;
+  box-shadow: 0 10px 24px rgba(23, 32, 39, 0.18);
 }
 
 .nav-links {

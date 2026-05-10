@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+  <title id="title">Programmer logo</title>
+  <desc id="desc">A compact programmer mark with code brackets and a terminal cursor.</desc>
+  <defs>
+    <linearGradient id="bg" x1="18" y1="10" x2="78" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#172027"/>
+      <stop offset="1" stop-color="#293340"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="21" y1="24" x2="75" y2="70" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#b9472f"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="22" fill="url(#bg)"/>
+  <path d="M31 35 18 48l13 13" fill="none" stroke="#f8fafc" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M65 35 78 48 65 61" fill="none" stroke="#f8fafc" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M54 25 42 71" fill="none" stroke="url(#accent)" stroke-width="7" stroke-linecap="round"/>
+  <path d="M34 73h28" fill="none" stroke="#7dd3fc" stroke-width="6" stroke-linecap="round"/>
+</svg>
