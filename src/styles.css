@@ -257,18 +257,50 @@ a {
 
 .article-content pre {
   overflow-x: auto;
-  padding: 20px;
+  padding: 22px;
   border-radius: 8px;
-  background: var(--code-bg);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0)),
+    var(--code-bg);
   color: var(--code-ink);
   font-size: 15px;
   line-height: 1.6;
+  box-shadow: 0 18px 45px rgba(23, 32, 39, 0.16);
 }
 
 .article-content pre code {
   padding: 0;
   background: transparent;
   color: inherit;
+  font-size: inherit;
+}
+
+.tok-comment {
+  color: #82929f;
+  font-style: italic;
+}
+
+.tok-keyword {
+  color: #ff7b9c;
+  font-weight: 700;
+}
+
+.tok-string {
+  color: #9be28f;
+}
+
+.tok-number,
+.tok-literal {
+  color: #f0b86e;
+}
+
+.tok-type {
+  color: #7dd3fc;
+}
+
+.tok-punctuation {
+  color: #b7c1ca;
 }
 
 .footer {

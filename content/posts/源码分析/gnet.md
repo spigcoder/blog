@@ -4,9 +4,9 @@
 
 这是我做的第一篇源码分析相关的文章，主要想记录自己从开源项目中学习到的内容，首先在学习一个开源项目之前应该要使用起来，同样，一般这里的使用也是我们分析的入口。
 
-我们首先通过阅读官方文档知道 gnet 原始的做法是不支持我们在业务逻辑中运行一些阻塞代码的，因为 read-compute-write 是一条路，如果我们在 compute 的时候阻塞了，那么当前 subreactor 就不可以监听连接了，这里 gnet 使用了线程池来解决这个问题，做法如图：![image-20260501184116539](/Users/x/Library/Application Support/typora-user-images/image-20260501184116539.png)
+我们首先通过阅读官方文档知道 gnet 原始的做法是不支持我们在业务逻辑中运行一些阻塞代码的，因为 read-compute-write 是一条路，如果我们在 compute 的时候阻塞了，那么当前 subreactor 就不可以监听连接了，这里 gnet 使用了线程池来解决这个问题，做法如图：![image-20260501184116539](http://www.spigcoder.com/boke/image-20260501184116539.png)
 
-![image-20260501184134570](/Users/x/Library/Application Support/typora-user-images/image-20260501184134570.png)
+![image-20260501184134570](http://www.spigcoder.com/boke/image-20260501184134570.png)
 
  但其实如果只是看到这里，我们应该都是有一些问题的：
 

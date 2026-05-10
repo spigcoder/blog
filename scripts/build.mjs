@@ -98,6 +98,62 @@ function inlineMarkdown(text) {
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
 }
 
+function normalizeLanguage(language, code) {
+  const hint = language.trim().toLowerCase();
+  if (hint) return hint;
+  if (/\b(package|func|type|struct|interface|defer|go|chan|map)\b/.test(code)) return "go";
+  if (/\b(function|const|let|var|return|import|export|async|await)\b/.test(code)) return "js";
+  if (/\b(class|def|self|None|True|False|import)\b/.test(code)) return "python";
+  if (/<[a-z][\s\S]*>/i.test(code)) return "html";
+  return "text";
+}
+
+function highlightCode(code, language = "") {
+  const lang = normalizeLanguage(language, code);
+  const keywordSet = new Set([
+    "abstract", "as", "async", "await", "break", "case", "catch", "chan", "class",
+    "const", "continue", "default", "defer", "delete", "do", "else", "export",
+    "extends", "fallthrough", "finally", "for", "from", "func", "function", "go",
+    "if", "import", "in", "interface", "let", "map", "new", "package", "range",
+    "return", "select", "struct", "switch", "throw", "try", "type", "var", "while",
+    "with", "yield"
+  ]);
+  const literalSet = new Set([
+    "false", "nil", "null", "None", "true", "True", "False", "undefined"
+  ]);
+  const typeSet = new Set([
+    "bool", "byte", "complex64", "complex128", "error", "float32", "float64",
+    "int", "int8", "int16", "int32", "int64", "rune", "string", "uint", "uint8",
+    "uint16", "uint32", "uint64", "uintptr", "Array", "Boolean", "Map", "Number",
+    "Object", "Promise", "Set", "String", "Symbol"
+  ]);
+  const tokenPattern = /\/\/.*|\/\*[\s\S]*?\*\/|#.*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b|[{}()[\].,;:+\-*/%=&|!<>]+/g;
+  let html = "";
+  let lastIndex = 0;
+
+  for (const match of code.matchAll(tokenPattern)) {
+    const token = match[0];
+    html += escapeHtml(code.slice(lastIndex, match.index));
+
+    let className = "";
+    if (/^(\/\/|\/\*|#)/.test(token)) className = "tok-comment";
+    else if (/^["'`]/.test(token)) className = "tok-string";
+    else if (/^\d/.test(token)) className = "tok-number";
+    else if (keywordSet.has(token)) className = "tok-keyword";
+    else if (literalSet.has(token)) className = "tok-literal";
+    else if (typeSet.has(token) || /^[A-Z][A-Za-z0-9_]*$/.test(token)) className = "tok-type";
+    else if (/^[{}()[\].,;:+\-*/%=&|!<>]+$/.test(token)) className = "tok-punctuation";
+
+    html += className
+      ? `<span class="${className}">${escapeHtml(token)}</span>`
+      : escapeHtml(token);
+    lastIndex = match.index + token.length;
+  }
+
+  html += escapeHtml(code.slice(lastIndex));
+  return { html, lang };
+}
+
 function markdownToHtml(markdown) {
   const lines = markdown.split(/\r?\n/);
   const html = [];
@@ -105,6 +161,7 @@ function markdownToHtml(markdown) {
   let list = [];
   let inCode = false;
   let codeLines = [];
+  let codeLanguage = "";
 
   const flushParagraph = () => {
     if (!paragraph.length) return;
@@ -121,12 +178,15 @@ function markdownToHtml(markdown) {
   for (const line of lines) {
     if (line.startsWith("```")) {
       if (inCode) {
-        html.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        const highlighted = highlightCode(codeLines.join("\n"), codeLanguage);
+        html.push(`<pre class="code-block language-${highlighted.lang}"><code>${highlighted.html}</code></pre>`);
         codeLines = [];
+        codeLanguage = "";
         inCode = false;
       } else {
         flushParagraph();
         flushList();
+        codeLanguage = line.slice(3).trim().split(/\s+/)[0] || "";
         inCode = true;
       }
       continue;
