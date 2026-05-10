@@ -105,9 +105,12 @@ function parseFrontmatter(raw, fallbackTitle) {
   return { data, body };
 }
 
-function isRemoteOrSiteAsset(src) {
-  return /^(https?:)?\/\//i.test(src)
-    || /^data:/i.test(src)
+function isRemoteAsset(src) {
+  return /^(https?:)?\/\//i.test(src);
+}
+
+function isExternalOrSiteAsset(src) {
+  return /^data:/i.test(src)
     || /^mailto:/i.test(src)
     || src.startsWith("/assets/");
 }
@@ -139,43 +142,127 @@ function resolveLocalAssetPath(src, markdownDir) {
     : path.resolve(markdownDir, decoded);
 }
 
-async function materializeMarkdownImages(markdown, markdownDir, slug) {
-  const imagePattern = /!\[([^\]]*)\]\(([^)\n]+)\)/g;
-  let result = "";
-  let lastIndex = 0;
+function extensionFromContentType(contentType = "") {
+  if (contentType.includes("jpeg")) return ".jpg";
+  if (contentType.includes("png")) return ".png";
+  if (contentType.includes("gif")) return ".gif";
+  if (contentType.includes("webp")) return ".webp";
+  if (contentType.includes("svg")) return ".svg";
+  return "";
+}
 
-  for (const match of markdown.matchAll(imagePattern)) {
-    const [raw, alt, rawSrc] = match;
-    const src = stripMarkdownUrlWrapper(rawSrc);
-    result += markdown.slice(lastIndex, match.index);
-    lastIndex = match.index + raw.length;
+function extensionFromUrl(src) {
+  try {
+    const url = new URL(src.startsWith("//") ? `https:${src}` : src);
+    return path.extname(url.pathname);
+  } catch {
+    return "";
+  }
+}
 
-    if (isRemoteOrSiteAsset(src)) {
-      result += raw;
-      continue;
-    }
+function assetFileName(slug, sourceName, extension, hashInput) {
+  const baseName = sanitizeAssetName(path.basename(sourceName, extension || path.extname(sourceName)));
+  const hash = createHash("sha1").update(hashInput).digest("hex").slice(0, 10);
+  return `${sanitizeAssetName(slug.replaceAll("/", "-"))}-${baseName}-${hash}${extension || ".png"}`;
+}
 
-    const sourcePath = resolveLocalAssetPath(src, markdownDir);
-    if (!existsSync(sourcePath)) {
-      console.warn(`[warn] Image not found: ${src}`);
-      result += raw;
-      continue;
-    }
+async function materializeRemoteAsset(src, slug) {
+  const normalizedSrc = src.startsWith("//") ? `https:${src}` : src;
+  const assetDir = path.join(publicDir, "assets", "posts");
+  const urlPath = new URL(normalizedSrc).pathname;
+  const sourceName = path.basename(urlPath) || "remote-image";
+  const initialExtension = path.extname(urlPath);
+  const initialName = assetFileName(slug, sourceName, initialExtension || ".png", normalizedSrc);
+  const initialTarget = path.join(assetDir, initialName);
 
-    const extension = path.extname(sourcePath) || ".png";
-    const baseName = sanitizeAssetName(path.basename(sourcePath, extension));
-    const hash = createHash("sha1").update(sourcePath).digest("hex").slice(0, 10);
-    const fileName = `${sanitizeAssetName(slug.replaceAll("/", "-"))}-${baseName}-${hash}${extension}`;
-    const assetDir = path.join(publicDir, "assets", "posts");
-    const targetPath = path.join(assetDir, fileName);
-
-    await mkdir(assetDir, { recursive: true });
-    await copyFile(sourcePath, targetPath);
-
-    result += `![${alt}](/assets/posts/${fileName})`;
+  if (existsSync(initialTarget)) {
+    return `/assets/posts/${initialName}`;
   }
 
-  return result + markdown.slice(lastIndex);
+  const response = await fetch(normalizedSrc);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+  const extension = initialExtension || extensionFromContentType(contentType) || ".png";
+  const fileName = assetFileName(slug, sourceName, extension, normalizedSrc);
+  const targetPath = path.join(assetDir, fileName);
+
+  await mkdir(assetDir, { recursive: true });
+  if (!existsSync(targetPath)) {
+    const buffer = Buffer.from(await response.arrayBuffer());
+    await writeFile(targetPath, buffer);
+  }
+
+  return `/assets/posts/${fileName}`;
+}
+
+async function materializeLocalAsset(src, markdownDir, slug) {
+  const sourcePath = resolveLocalAssetPath(src, markdownDir);
+  if (!existsSync(sourcePath)) {
+    throw new Error(`not found: ${src}`);
+  }
+
+  const extension = path.extname(sourcePath) || ".png";
+  const fileName = assetFileName(slug, path.basename(sourcePath), extension, sourcePath);
+  const assetDir = path.join(publicDir, "assets", "posts");
+  const targetPath = path.join(assetDir, fileName);
+
+  await mkdir(assetDir, { recursive: true });
+  await copyFile(sourcePath, targetPath);
+
+  return `/assets/posts/${fileName}`;
+}
+
+async function materializeImageSrc(src, markdownDir, slug) {
+  const cleanSrc = stripMarkdownUrlWrapper(src);
+  if (isExternalOrSiteAsset(cleanSrc)) return cleanSrc;
+
+  if (isRemoteAsset(cleanSrc)) {
+    try {
+      return await materializeRemoteAsset(cleanSrc, slug);
+    } catch (error) {
+      console.warn(`[warn] Remote image was not cached: ${cleanSrc} (${error.message})`);
+      return cleanSrc;
+    }
+  }
+
+  try {
+    return await materializeLocalAsset(cleanSrc, markdownDir, slug);
+  } catch (error) {
+    console.warn(`[warn] Local image was not cached: ${cleanSrc} (${error.message})`);
+    return cleanSrc;
+  }
+}
+
+async function materializeMarkdownImages(markdown, markdownDir, slug) {
+  const lines = markdown.split(/\r?\n/);
+  const output = [];
+
+  for (const line of lines) {
+    const standalone = line.match(/^(\s*)!\[([^\]]*)\]\((.+)\)(\s*)$/);
+    if (standalone) {
+      const [, leading, alt, rawSrc, trailing] = standalone;
+      const materializedSrc = await materializeImageSrc(rawSrc, markdownDir, slug);
+      output.push(`${leading}![${alt}](${materializedSrc})${trailing}`);
+      continue;
+    }
+
+    let rewritten = "";
+    let lastIndex = 0;
+    const inlineImagePattern = /!\[([^\]]*)\]\(([^)\n]+)\)/g;
+    for (const match of line.matchAll(inlineImagePattern)) {
+      const [raw, alt, rawSrc] = match;
+      rewritten += line.slice(lastIndex, match.index);
+      const materializedSrc = await materializeImageSrc(rawSrc, markdownDir, slug);
+      rewritten += `![${alt}](${materializedSrc})`;
+      lastIndex = match.index + raw.length;
+    }
+    output.push(rewritten ? rewritten + line.slice(lastIndex) : line);
+  }
+
+  return output.join("\n");
 }
 
 function inlineMarkdown(text) {
@@ -420,8 +507,12 @@ async function readPosts() {
     const category = segments.length > 1 ? segments[0] : "未分类";
     const slug = segments.map(slugify).join("/");
     const title = data.title || fallbackTitle;
-    const normalizedBody = body.replace(new RegExp(`^#\\s+${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n+`), "");
-    const htmlBody = await materializeMarkdownImages(normalizedBody, path.dirname(file.absolute), slug);
+    const materializedBody = await materializeMarkdownImages(body, path.dirname(file.absolute), slug);
+    if (materializedBody !== body) {
+      await writeFile(file.absolute, raw.replace(body, materializedBody));
+    }
+
+    const normalizedBody = materializedBody.replace(new RegExp(`^#\\s+${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n+`), "");
     const excerpt = data.excerpt || normalizedBody.replace(/[#>*`-]/g, "").trim().slice(0, 96);
 
     posts.push({
@@ -433,7 +524,7 @@ async function readPosts() {
       dateText: formatDate(data.date),
       tags: Array.isArray(data.tags) ? data.tags : [],
       excerpt,
-      html: markdownToHtml(htmlBody)
+      html: markdownToHtml(normalizedBody)
     });
   }
 
