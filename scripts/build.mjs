@@ -1,6 +1,8 @@
 import { cp, mkdir, readFile, readdir, rm, writeFile, copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const root = process.cwd();
 const postsDir = path.join(root, "content", "posts");
@@ -103,13 +105,96 @@ function parseFrontmatter(raw, fallbackTitle) {
   return { data, body };
 }
 
+function isRemoteOrSiteAsset(src) {
+  return /^(https?:)?\/\//i.test(src)
+    || /^data:/i.test(src)
+    || /^mailto:/i.test(src)
+    || src.startsWith("/assets/");
+}
+
+function stripMarkdownUrlWrapper(src) {
+  return src.trim().replace(/^<|>$/g, "");
+}
+
+function sanitizeAssetName(value) {
+  return value
+    .normalize("NFKD")
+    .replace(/[^\w.\-\u4e00-\u9fa5]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    || "image";
+}
+
+function resolveLocalAssetPath(src, markdownDir) {
+  const cleanSrc = stripMarkdownUrlWrapper(src);
+  const withoutHash = cleanSrc.split("#")[0].split("?")[0];
+
+  if (withoutHash.startsWith("file://")) {
+    return fileURLToPath(withoutHash);
+  }
+
+  const decoded = decodeURI(withoutHash);
+  return path.isAbsolute(decoded)
+    ? decoded
+    : path.resolve(markdownDir, decoded);
+}
+
+async function materializeMarkdownImages(markdown, markdownDir, slug) {
+  const imagePattern = /!\[([^\]]*)\]\(([^)\n]+)\)/g;
+  let result = "";
+  let lastIndex = 0;
+
+  for (const match of markdown.matchAll(imagePattern)) {
+    const [raw, alt, rawSrc] = match;
+    const src = stripMarkdownUrlWrapper(rawSrc);
+    result += markdown.slice(lastIndex, match.index);
+    lastIndex = match.index + raw.length;
+
+    if (isRemoteOrSiteAsset(src)) {
+      result += raw;
+      continue;
+    }
+
+    const sourcePath = resolveLocalAssetPath(src, markdownDir);
+    if (!existsSync(sourcePath)) {
+      console.warn(`[warn] Image not found: ${src}`);
+      result += raw;
+      continue;
+    }
+
+    const extension = path.extname(sourcePath) || ".png";
+    const baseName = sanitizeAssetName(path.basename(sourcePath, extension));
+    const hash = createHash("sha1").update(sourcePath).digest("hex").slice(0, 10);
+    const fileName = `${sanitizeAssetName(slug.replaceAll("/", "-"))}-${baseName}-${hash}${extension}`;
+    const assetDir = path.join(publicDir, "assets", "posts");
+    const targetPath = path.join(assetDir, fileName);
+
+    await mkdir(assetDir, { recursive: true });
+    await copyFile(sourcePath, targetPath);
+
+    result += `![${alt}](/assets/posts/${fileName})`;
+  }
+
+  return result + markdown.slice(lastIndex);
+}
+
 function inlineMarkdown(text) {
   return escapeHtml(text)
-    .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" loading="lazy">')
+    .replace(/!\[([^\]]*)\]\(([^()\s]+(?:\([^)]*\)[^()\s]*)*)\)/g, '<img src="$2" alt="$1" loading="lazy">')
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+    .replace(/\[([^\]]+)\]\(([^()\s]+(?:\([^)]*\)[^()\s]*)*)\)/g, '<a href="$2">$1</a>');
+}
+
+function renderImage(src, alt = "") {
+  const safeSrc = escapeHtml(src);
+  const safeAlt = escapeHtml(alt);
+  return `<figure class="article-image">
+  <a href="${safeSrc}" target="_blank" rel="noopener noreferrer">
+    <img src="${safeSrc}" alt="${safeAlt}" loading="lazy">
+  </a>
+</figure>`;
 }
 
 function normalizeLanguage(language, code) {
@@ -173,6 +258,7 @@ function markdownToHtml(markdown) {
   const html = [];
   let paragraph = [];
   let list = [];
+  let listType = "";
   let inCode = false;
   let codeLines = [];
   let codeLanguage = "";
@@ -185,8 +271,10 @@ function markdownToHtml(markdown) {
 
   const flushList = () => {
     if (!list.length) return;
-    html.push(`<ul>${list.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</ul>`);
+    const tag = listType || "ul";
+    html.push(`<${tag}>${list.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</${tag}>`);
     list = [];
+    listType = "";
   };
 
   for (const line of lines) {
@@ -226,10 +314,29 @@ function markdownToHtml(markdown) {
       continue;
     }
 
+    const image = line.match(/^!\[([^\]]*)\]\(([^()\s]+(?:\([^)]*\)[^()\s]*)*)\)$/);
+    if (image) {
+      flushParagraph();
+      flushList();
+      html.push(renderImage(image[2], image[1]));
+      continue;
+    }
+
     const bullet = line.match(/^\s*[-*]\s+(.+)$/);
     if (bullet) {
       flushParagraph();
+      if (listType && listType !== "ul") flushList();
+      listType = "ul";
       list.push(bullet[1]);
+      continue;
+    }
+
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (ordered) {
+      flushParagraph();
+      if (listType && listType !== "ol") flushList();
+      listType = "ol";
+      list.push(ordered[1]);
       continue;
     }
 
@@ -314,6 +421,7 @@ async function readPosts() {
     const slug = segments.map(slugify).join("/");
     const title = data.title || fallbackTitle;
     const normalizedBody = body.replace(new RegExp(`^#\\s+${title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\n+`), "");
+    const htmlBody = await materializeMarkdownImages(normalizedBody, path.dirname(file.absolute), slug);
     const excerpt = data.excerpt || normalizedBody.replace(/[#>*`-]/g, "").trim().slice(0, 96);
 
     posts.push({
@@ -325,7 +433,7 @@ async function readPosts() {
       dateText: formatDate(data.date),
       tags: Array.isArray(data.tags) ? data.tags : [],
       excerpt,
-      html: markdownToHtml(normalizedBody)
+      html: markdownToHtml(htmlBody)
     });
   }
 

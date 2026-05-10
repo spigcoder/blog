@@ -10,7 +10,7 @@
 
 首先我们看一下 intel Skylake 的一个架构图
 
-![image-20260510184143602](http://www.spigcoder.com/boke/image-20260510184143602.png)
+![image-20260510214611814](/Users/x/Library/Application Support/typora-user-images/image-20260510214611814.png)
 
 ## 1. 为什么现代 CPU 不是简单流水线
 

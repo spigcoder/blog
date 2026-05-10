@@ -401,6 +401,7 @@ a {
 .article-content p,
 .article-content ul,
 .article-content ol,
+.article-content figure,
 .article-content blockquote {
   margin: 20px 0;
 }
@@ -412,6 +413,7 @@ a {
 .article-content li,
 .article-content blockquote,
 .article-content pre,
+.article-content figure,
 .article-content p:has(img) {
   text-indent: 0;
 }
@@ -423,6 +425,15 @@ a {
 
 .article-content li + li {
   margin-top: 8px;
+}
+
+.article-content .article-image {
+  margin: 30px 0;
+}
+
+.article-content .article-image a {
+  display: block;
+  border-bottom: 0;
 }
 
 .article-content img {
