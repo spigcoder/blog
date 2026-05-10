@@ -68,7 +68,7 @@ func (c *conn) processIO(_ int, filter netpoll.IOEvent, flags netpoll.IOFlags) (
 	return
 }
 
-unc (el *eventloop) read(c *conn) error {
+func (el *eventloop) read(c *conn) error {
 	if !c.opened {
 		return nil
 	}

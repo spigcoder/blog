@@ -11,7 +11,20 @@ const distDir = path.join(root, "dist");
 const site = {
   title: "技术笔记",
   description: "一个简洁、快速、面向长期写作的个人技术博客。",
-  motto: "保持前进的姿态，比写出完美的代码重要10000倍"
+  motto: "保持前进的姿态，比写出完美的代码重要10000倍",
+  defaultCover: "/assets/cover.png",
+  categories: [
+    {
+      name: "开发内功",
+      href: "/blog/开发内功/",
+      description: "计算机基础、工程能力、系统设计和长期可复用的技术积累。"
+    },
+    {
+      name: "源码分析",
+      href: "/blog/源码分析/",
+      description: "从真实项目源码出发，拆解架构、关键路径和工程取舍。"
+    }
+  ]
 };
 
 function escapeHtml(value = "") {
@@ -92,6 +105,7 @@ function parseFrontmatter(raw, fallbackTitle) {
 
 function inlineMarkdown(text) {
   return escapeHtml(text)
+    .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" loading="lazy">')
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/\*([^*]+)\*/g, "<em>$1</em>")
@@ -246,6 +260,10 @@ function formatDate(date) {
 }
 
 function layout({ title, description, body }) {
+  const categoryLinks = site.categories
+    .map((category) => `<a href="${category.href}">${escapeHtml(category.name)}</a>`)
+    .join("");
+
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -260,9 +278,9 @@ function layout({ title, description, body }) {
     <nav class="nav">
       <a class="brand" href="/">${escapeHtml(site.title)}</a>
       <div class="nav-links">
-        <a href="/">首页</a>
-        <a href="/blog/">文章</a>
+        ${categoryLinks}
       </div>
+      <a class="home-link" href="/">首页</a>
     </nav>
   </header>
   ${body}
@@ -274,7 +292,7 @@ function layout({ title, description, body }) {
 function postCard(post) {
   return `<a class="post-card" href="/blog/${post.slug}/">
   <div>
-    <div class="meta">${post.dateText ? `<span>${post.dateText}</span>` : ""}</div>
+    <div class="meta">${post.dateText ? `<span>${post.dateText}</span>` : ""}<span>${escapeHtml(post.category)}</span></div>
     <h3>${escapeHtml(post.title)}</h3>
     <p>${escapeHtml(post.excerpt)}</p>
   </div>
@@ -302,6 +320,7 @@ async function readPosts() {
       slug,
       category,
       title,
+      cover: data.cover || "",
       date: data.date || "",
       dateText: formatDate(data.date),
       tags: Array.isArray(data.tags) ? data.tags : [],
@@ -324,12 +343,26 @@ async function build() {
 
   const latest = posts.slice(0, 4).map(postCard).join("\n");
   const groupedPosts = Map.groupBy(posts, (post) => post.category);
-  const categorySections = [...groupedPosts.entries()].map(([category, categoryPosts]) => `<section class="category-block">
+  const knownCategoryNames = site.categories.map((category) => category.name);
+  const orderedCategoryNames = [
+    ...knownCategoryNames,
+    ...[...groupedPosts.keys()].filter((category) => !knownCategoryNames.includes(category))
+  ];
+  const categorySections = orderedCategoryNames.map((category) => {
+    const categoryPosts = groupedPosts.get(category) || [];
+    if (!categoryPosts.length && !knownCategoryNames.includes(category)) return "";
+    const categoryMeta = site.categories.find((item) => item.name === category);
+    return `<section class="category-block">
     <div class="section-title">
-      <h2>${escapeHtml(category)}</h2>
+      <div>
+        <p class="section-kicker">${categoryPosts.length} 篇文章</p>
+        <h2>${escapeHtml(category)}</h2>
+      </div>
+      ${categoryMeta ? `<a href="${categoryMeta.href}">进入目录</a>` : ""}
     </div>
-    <div class="post-grid">${categoryPosts.map(postCard).join("\n")}</div>
-  </section>`).join("\n");
+    ${categoryPosts.length ? `<div class="post-grid">${categoryPosts.map(postCard).join("\n")}</div>` : `<p class="empty-state">这个目录还没有文章，之后可以把 Markdown 放到 <code>content/posts/${escapeHtml(category)}/</code>。</p>`}
+  </section>`;
+  }).join("\n");
 
   const indexBody = `<main>
   <section class="hero">
@@ -340,7 +373,10 @@ async function build() {
   </section>
   <section class="section">
     <div class="section-title">
-      <h2>最新文章</h2>
+      <div>
+        <p class="section-kicker">最近更新</p>
+        <h2>最新文章</h2>
+      </div>
       <a href="/blog/">查看全部</a>
     </div>
     <div class="post-grid">${latest}</div>
@@ -366,11 +402,36 @@ async function build() {
     body: blogBody
   }));
 
+  for (const category of site.categories) {
+    const categoryPosts = groupedPosts.get(category.name) || [];
+    const categoryDir = path.join(distDir, "blog", category.name);
+    await mkdir(categoryDir, { recursive: true });
+    const body = `<main class="section category-page">
+  <header class="category-hero">
+    <p class="section-kicker">目录</p>
+    <h1>${escapeHtml(category.name)}</h1>
+    <p>${escapeHtml(category.description)}</p>
+  </header>
+  ${categoryPosts.length ? `<div class="post-grid">${categoryPosts.map(postCard).join("\n")}</div>` : `<p class="empty-state">这个目录还没有文章。把 Markdown 放到 <code>content/posts/${escapeHtml(category.name)}/</code> 后重新构建即可。</p>`}
+</main>`;
+
+    await writeFile(path.join(categoryDir, "index.html"), layout({
+      title: category.name,
+      description: category.description,
+      body
+    }));
+  }
+
   for (const post of posts) {
     const postDir = path.join(distDir, "blog", post.slug);
     await mkdir(postDir, { recursive: true });
     const tags = post.tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("");
-    const body = `<main class="article-shell">
+    const cover = post.cover ? `<figure class="article-cover">
+    <img src="${escapeHtml(post.cover)}" alt="${escapeHtml(post.title)}">
+  </figure>` : "";
+    const body = `<main>
+  ${cover}
+  <div class="article-shell">
   <article>
     <header class="article-header">
       <div class="meta">${post.dateText ? `<span>${post.dateText}</span>` : ""}</div>
@@ -379,6 +440,7 @@ async function build() {
     </header>
     <div class="article-content">${post.html}</div>
   </article>
+  </div>
 </main>`;
 
     await writeFile(path.join(postDir, "index.html"), layout({
