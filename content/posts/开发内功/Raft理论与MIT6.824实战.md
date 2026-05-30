@@ -48,7 +48,7 @@ Raft 中的节点只有三种角色：Follower、Candidate、Leader。正常情�
 
 一个 Candidate 成为 Leader 的条件是拿到多数派投票。多数派的作用不是“人数更多所以更可信”，而是保证任意两个多数派之间必然有交集。只要一个 term 内每个节点最多投一票，同一个 term 就不可能出现两个都拿到多数派的 Leader。
 
-随机选举超时用于减少多个节点同时发起选举的概率。论文中给出的典型选举超时是 150 到 300ms。
+随机选举超时用于减少多个节点同时发起选举的概率。论文中给出的典型选举超时是 150 到 300ms，但 MIT Lab 对心跳频率有限制，因此实验实现通常会使用更大的选举超时，保证心跳频率、选举速度和测试约束之间保持平衡。在这个实验实现中，`TIMEOUTLOW = 500ms`、`TIMEOUTHIGH = 1000ms`，Leader 每 150ms 发送一次心跳，正是这种实验环境下的取舍。
 
 `RequestVote` 不是只看 term。Candidate 还必须证明自己的日志至少和投票者一样新。比较规则是先看最后一条日志的 term，term 更大者更新；term 相同再比较最后日志索引。这个限制对应论文中的 Leader Completeness：一个已经提交的日志项必须出现在后续 Leader 的日志中。否则，一个日志落后的节点可能当选 Leader，并覆盖已经提交过的日志。
 
@@ -62,7 +62,7 @@ Raft 中的节点只有三种角色：Follower、Candidate、Leader。正常情�
 
 Follower 收到 `AppendEntries` 后，核心逻辑可以拆成三步：先拒绝过期 term；再检查 `PrevLogIndex/PrevLogTerm` 是否匹配；如果匹配，则删除本地冲突日志，并追加 Leader 发来的新日志。MIT 6.824 的实现通常也会按这个路径组织：前驱不匹配就返回失败；匹配后从 `PrevLogIndex + 1` 开始比较新旧日志，遇到 term 冲突就截断并追加。
 
-Leader 收到失败回复后，需要回退对应 Follower 的 `nextIndex` 并重试。最朴素的做法是每次减一，实验实现直接采用了这种策略：
+Leader 收到失败回复后，需要回退对应 Follower 的 `nextIndex` 并重试。最朴素的做法是每次减一，这个实验实现直接采用了这种策略：
 
 ```go
 rf.nextIndex[server] = int(math.Max(1.0, float64(rf.nextIndex[server]-1)))
@@ -123,19 +123,33 @@ MIT 6.5840 Lab 3D 就要求实现 `Snapshot(index int, snapshot []byte)` 和 `In
 
 ## etcd 如何把 Raft 工程化
 
-MIT 6.824 的实验实现通常把 Raft、RPC、持久化和 `applyCh` 都放在一个相对紧凑的结构里，适合学习协议本身。etcd 的实现则更接近真实工程：它把 Raft 共识逻辑做成算法层，把网络通信、WAL 持久化、快照和业务状态机交给应用层。
+MIT 6.824 的实验实现通常把 Raft、RPC、持久化和 `applyCh` 放在一个相对紧凑的结构里，适合学习协议本身。etcd 面对的是另一类问题：Raft 不只是要通过测试，还要长期运行在真实集群里，处理网络收发、WAL 落盘、快照压缩、配置变更、线性一致读和选举抖动。于是 etcd 把 Raft 做成一个相对纯粹的算法层，把网络、磁盘和业务状态机留给应用层。
 
-这个拆分的关键接口是 `Node`。应用层通过 `Tick` 驱动 Raft 内部计时，通过 `Propose` 提交写请求，通过 `Step` 把网络收到的 Raft 消息送回算法层，通过 `Ready` 接收算法层产生的结果，再在处理完持久化、发送消息和应用提交日志后调用 `Advance`。这形成了一个稳定循环：
+这个拆分不是为了让代码显得“分层”，而是为了划清故障边界。算法层只负责回答几个问题：这条消息在 Raft 状态机里会造成什么状态变化？有哪些日志需要持久化？哪些日志已经可以提交？哪些消息需要发给其他节点？至于这些日志写到哪个 WAL 文件、消息通过什么 transport 发出去、已提交日志如何作用到 KV 状态机，都由应用层负责。
+
+`Node` 是这个边界上的核心接口。应用层通过 `Tick` 给 Raft 提供时间推进，通过 `Propose` 提交写请求，通过 `Step` 把网络收到的 Raft 消息送进算法层。算法层处理完一轮状态变化后，不直接写磁盘，也不直接发网络包，而是把结果打包成 `Ready` 交给应用层。应用层必须先持久化 `Ready.Entries` 和 `HardState`，再发送 `Ready.Messages`，再把 `Ready.CommittedEntries` 应用到状态机，最后调用 `Advance` 告诉算法层这一轮已经处理完。
 
 ```text
 Propose / Step / Tick -> Raft 算法层 -> Ready -> 持久化 / 发送消息 / 应用日志 -> Advance
 ```
 
-这个模型的好处是边界很清楚。Raft 算法层只决定“应该产生哪些日志、哪些日志已提交、哪些消息需要发送”；应用层负责“如何落盘、如何发网络包、如何把已提交日志作用到 KV 状态机”。因此 etcd 的 `Ready` 里会同时包含几类信息：需要持久化的 `Entries`，需要应用到状态机的 `CommittedEntries`，需要发给其他节点的 `Messages`，以及需要持久化的 `HardState`。
+这一点比接口名本身更重要：Raft 的安全性要求“先稳定记录，再对外产生影响”。如果一条日志还没落盘就把复制消息发出，节点崩溃后可能忘记自己已经承诺过的内容；如果提交日志没有按顺序应用到状态机，复制状态机的一致性也会被破坏。`Ready -> 持久化 -> 发送 -> 应用 -> Advance` 这条路径，就是 etcd 把论文规则落到工程时序上的方式。
 
-etcd 的 `raftLog` 也把日志状态拆得更细：`unstable` 保存尚未持久化的日志和快照，`storage` 是持久化日志的查询接口，`committed` 表示已提交位置，`applied` 表示已应用位置。这个结构和 MIT 6.824 里的 `log`、`commitIndex`、`lastApplied` 是同一套语义，只是工程化后把内存态、持久化态和应用态分离得更明确。
+日志模块也体现了这种边界。etcd 的 `raftLog` 里，`unstable` 保存尚未持久化的日志和快照，`storage` 是持久化日志的查询接口，`committed` 表示已提交位置，`applied` 表示已应用位置。它们和 MIT 6.824 实现里的 `log`、`commitIndex`、`lastApplied` 是同一套语义，但 etcd 把“内存中刚产生的日志”“已经稳定落盘的日志”“已经提交但未应用的日志”拆得更明确。真实系统里的重启恢复、快照安装和落后节点追赶，都依赖这几个状态边界不混在一起。
 
-Leader 侧的 `Progress` 则对应 MIT 实现里的 `nextIndex` 和 `matchIndex`。每个 Follower 都有自己的复制进度，Leader 根据这些进度判断多数派复制是否成立，并据此推进 commit。真实系统还会在这个基础上处理流控、批量发送、快照补齐、ReadIndex 等能力，这些都不是 Raft 安全性的核心规则，但决定了实现能否稳定支撑生产负载。
+写路径仍然遵守 Raft 的强 Leader 模型。应用层收到写请求后，通过 `Node.Propose` 进入算法层；如果当前节点是 Follower，请求会被转发给 Leader；Leader 把请求变成日志项，更新各个 Follower 的复制进度，并通过 `Progress` 跟踪每个节点已经复制到哪里。`Progress.Match` 和 `Progress.Next` 对应实验实现里的 `matchIndex` 和 `nextIndex`，Leader 依靠这些复制进度判断某条日志是否已经被多数派接受，从而推进 commit。
+
+读路径则是 etcd 工程化里更容易误解的部分。Raft 论文的核心路径解决的是写入日志和提交日志，并不意味着任意 Follower 都可以直接读本地状态并得到线性一致结果。Follower 的本地状态可能落后，旧 Leader 在网络分区中也可能误以为自己仍然有效。etcd 可以让 Follower 承接读请求，但要区分读语义：如果业务接受可能过期的数据，serializable read 可以直接读本地状态；如果要求 linearizable read，就不能只相信本地状态。
+
+etcd 的做法是使用 ReadIndex 建立读屏障。Follower 收到线性一致读请求时，会把 `MsgReadIndex` 转发给 Leader。Leader 收到请求后，把当时的 `committed` 索引记录到 `readOnly` 队列中，然后广播一轮带有请求标识的心跳。只有当 Leader 收到多数派心跳响应，确认自己仍然拥有多数派意义上的领导权后，才会返回一个 `ReadIndexResp`，其中携带这次读对应的提交索引。Follower 拿到这个索引后，还要等自己的状态机至少应用到该位置，才能从本地状态机读取并响应客户端。
+
+因此，“Follower 可以读”并不是 Raft 协议天然允许 Follower 随意读；它背后有两层约束：Leader 通过 quorum 心跳证明领导权，读请求通过 read index 绑定到一个已经提交的日志位置，Follower 再等待本地 `applied` 追到这个位置。这样做的好处是读请求不必都写入一条日志，但仍然不会越过 Raft 的一致性边界。
+
+选举路径也有类似的工程补强。基础 Raft 依靠随机 election timeout 降低 split vote 概率，但真实集群里还会遇到小分区节点反复超时、不断自增 term，等网络恢复后迫使健康 Leader 退位的问题。etcd 引入 PreVote 后，节点在正式增加 term 之前先发起一轮预投票：只有确认自己大概率能拿到多数派，才进入真正的选举。预投票消息不会让其他节点因为看到更大的预期 term 就立刻更新本地 term，这能减少小分区带来的无意义选举。
+
+另一个机制是 CheckQuorum。Leader 会周期性确认自己是否仍然能联系到多数派；如果发现多数派不再活跃，就主动退回 Follower。这个机制服务于两个目标：一是避免失去多数派的旧 Leader 继续对外表现得像 Leader；二是配合 ReadIndex，保证 Leader 在处理线性一致读时确实仍然具备多数派意义上的领导权。
+
+把这些机制放在一起看，etcd 的工程化并不是把 Raft 代码拆成更多文件，而是在协议核心之外补上真实系统需要的时序约束：日志先落盘再发出影响，提交和应用分离，Follower 读必须经过 ReadIndex 屏障，选举前用 PreVote 减少 term 抖动，Leader 用 CheckQuorum 约束自己的有效性。这些机制不改变 Raft 的基本安全性证明，但决定了一个实现能不能在生产环境里稳定工作。
 
 ## 从 MIT 6.824 实现看常见坑
 
