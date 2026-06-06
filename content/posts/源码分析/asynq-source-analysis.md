@@ -1,3 +1,9 @@
+---
+title: "Asynq 源码分析：从任务创建到 Redis 状态机"
+tags: ["Go", "Asynq", "源码分析", "Redis", "任务队列"]
+excerpt: "从 Task、Client、Server 三条源码主线出发，理解 Asynq 如何基于 Redis 状态机、Lua 原子迁移、lease 续租和 recoverer 恢复机制实现分布式任务队列。"
+---
+
 # Asynq 源码分析：从任务创建到 Redis 状态机
 
 异步任务队列的接口通常很简单：业务侧创建一个任务，把它交给 Client；后台启动 Server，从队列里取出任务并交给 Handler 执行。Asynq 也是这个模型，但源码真正值得看的地方不在 API 表面，而在它如何把“提交任务”和“可靠执行”拆成一套 Redis 状态机。
@@ -452,73 +458,6 @@ return table.getn(ids)
 
 这解释了 Asynq 定时能力的精度边界：`ProcessAt/ProcessIn` 不是强实时定时器，而是“到指定时间后可以被转入 pending”。实际执行还受 forwarder 轮询间隔、Redis 延迟、worker 并发、队列优先级和积压量影响。
 
-### processor 从 pending 获取执行权
-
-`processor.exec` 是消费主干。它先通过信号量控制并发，然后从 broker 出队：
-
-```go
-func (p *processor) exec() {
-    select {
-    case <-p.quit:
-        return
-    case p.sema <- struct{}{}:
-        qnames := p.queues()
-        msg, leaseExpirationTime, err := p.broker.Dequeue(qnames...)
-        switch {
-        case errors.Is(err, errors.ErrNoProcessableTask):
-            ...
-            <-p.sema
-            return
-        case err != nil:
-            ...
-            <-p.sema
-            return
-        }
-
-        lease := base.NewLease(leaseExpirationTime)
-        deadline := p.computeDeadline(msg)
-        p.starting <- &workerInfo{msg, time.Now(), deadline, lease}
-
-        go func() {
-            defer func() {
-                p.finished <- msg
-                <-p.sema
-            }()
-            ...
-        }()
-    }
-}
-```
-
-这里的 `sema` 是并发控制点，它对应用户配置的 `Config.Concurrency`。拿不到信号量时，processor 不会继续创建 worker。拿到任务之后，任务会带着 lease 和 deadline 进入 worker goroutine。
-
-Redis 侧的 `Dequeue` 不是单纯从 list 弹出一个 ID。它要完成“获得执行权”：从 `pending` 取任务、写入 `active`、登记 lease，并返回任务消息。
-
-```go
-func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationTime time.Time, err error) {
-    for _, qname := range qnames {
-        keys := []string{
-            base.PendingKey(qname),
-            base.PausedKey(qname),
-            base.ActiveKey(qname),
-            base.LeaseKey(qname),
-        }
-        leaseExpirationTime = r.clock.Now().Add(LeaseDuration)
-        argv := []interface{}{
-            leaseExpirationTime.Unix(),
-            base.TaskKeyPrefix(qname),
-        }
-        res, err := dequeueCmd.Run(context.Background(), r.client, keys, argv...).Result()
-        ...
-        msg, err = base.DecodeMessage([]byte(encoded))
-        return msg, leaseExpirationTime, nil
-    }
-    return nil, time.Time{}, errors.E(op, errors.NotFound, errors.ErrNoProcessableTask)
-}
-```
-
-任务进入 `active` 后，即使 worker 崩溃也不会立即丢失。只要 lease 到期，恢复逻辑就能识别并重新调度。这是 Asynq 支持 worker 崩溃恢复的核心基础。
-
 ### 多台 Server 如何分布式消费同一个队列
 
 Asynq 被称为分布式任务队列，关键不在于 Server 之间互相通信，而在于它们共享同一个 Redis，并通过 Redis 的原子命令竞争任务处理权。可以把每一台机器上的 `Server` 看成一个独立 worker 进程：它们都运行自己的 `processor`，都监听相同的队列，也都调用同一个 `RDB.Dequeue`。
@@ -569,7 +508,7 @@ redis.call("ZADD", KEYS[4], ARGV[1], id)
 
 ### lease 如何续期：类似看门狗，但不是分布式锁
 
-在前面的 Processor 环节中我们看到他会调用这里的 Deque 函数，出队时写入的 `lease` 很容易被理解成分布式锁，但它更准确的含义是“任务处理权租约”。它不负责阻止其他任务入队，也不负责保证某类业务任务全局互斥；它只标记“某个具体 task ID 当前正在被某个 worker 处理，并且这个处理权什么时候过期”。
+出队时写入的 `lease` 很容易被理解成分布式锁，但它更准确的含义是“任务处理权租约”。它不负责阻止其他任务入队，也不负责保证某类业务任务全局互斥；它只标记“某个具体 task ID 当前正在被某个 worker 处理，并且这个处理权什么时候过期”。
 
 租约的初始时间来自 `RDB.Dequeue`：
 
@@ -660,13 +599,6 @@ type Lease struct {
     expireAt time.Time
 }
 
-func (l *Lease) IsValid() bool {
-	now := l.Clock.Now()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.expireAt.After(now) || l.expireAt.Equal(now)
-}
-
 func (l *Lease) Reset(expirationTime time.Time) bool {
     if !l.IsValid() {
         return false
@@ -729,6 +661,73 @@ Dequeue 时创建 30s lease
 ```
 
 它和分布式锁的差别在于：lease 绑定的是某个具体任务的处理权，不是某类业务资源的全局互斥。如果业务要求“同一类周期任务绝不并发”，仍然需要使用 `Unique`、任务 `Timeout/Deadline`，或者在 Handler 内部加业务互斥。
+
+### processor 从 pending 获取执行权
+
+`processor.exec` 是消费主干。它先通过信号量控制并发，然后从 broker 出队：
+
+```go
+func (p *processor) exec() {
+    select {
+    case <-p.quit:
+        return
+    case p.sema <- struct{}{}:
+        qnames := p.queues()
+        msg, leaseExpirationTime, err := p.broker.Dequeue(qnames...)
+        switch {
+        case errors.Is(err, errors.ErrNoProcessableTask):
+            ...
+            <-p.sema
+            return
+        case err != nil:
+            ...
+            <-p.sema
+            return
+        }
+
+        lease := base.NewLease(leaseExpirationTime)
+        deadline := p.computeDeadline(msg)
+        p.starting <- &workerInfo{msg, time.Now(), deadline, lease}
+
+        go func() {
+            defer func() {
+                p.finished <- msg
+                <-p.sema
+            }()
+            ...
+        }()
+    }
+}
+```
+
+这里的 `sema` 是并发控制点，它对应用户配置的 `Config.Concurrency`。拿不到信号量时，processor 不会继续创建 worker。拿到任务之后，任务会带着 lease 和 deadline 进入 worker goroutine。
+
+Redis 侧的 `Dequeue` 不是单纯从 list 弹出一个 ID。它要完成“获得执行权”：从 `pending` 取任务、写入 `active`、登记 lease，并返回任务消息。
+
+```go
+func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationTime time.Time, err error) {
+    for _, qname := range qnames {
+        keys := []string{
+            base.PendingKey(qname),
+            base.PausedKey(qname),
+            base.ActiveKey(qname),
+            base.LeaseKey(qname),
+        }
+        leaseExpirationTime = r.clock.Now().Add(LeaseDuration)
+        argv := []interface{}{
+            leaseExpirationTime.Unix(),
+            base.TaskKeyPrefix(qname),
+        }
+        res, err := dequeueCmd.Run(context.Background(), r.client, keys, argv...).Result()
+        ...
+        msg, err = base.DecodeMessage([]byte(encoded))
+        return msg, leaseExpirationTime, nil
+    }
+    return nil, time.Time{}, errors.E(op, errors.NotFound, errors.ErrNoProcessableTask)
+}
+```
+
+任务进入 `active` 后，即使 worker 崩溃也不会立即丢失。只要 lease 到期，恢复逻辑就能识别并重新调度。这是 Asynq 支持 worker 崩溃恢复的核心基础。
 
 ### Handler 返回值决定任务如何收束
 
