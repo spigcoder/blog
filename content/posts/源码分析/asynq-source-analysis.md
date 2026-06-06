@@ -567,6 +567,169 @@ redis.call("ZADD", KEYS[4], ARGV[1], id)
 
 这意味着“任务正在某个 worker 手里”也被持久化到了 Redis。只要 worker 正常运行，heartbeater 会持续记录进程和 worker 信息；如果进程崩溃，lease 到期后，`recoverer` 就能识别这些卡在 active 的任务，并把它们重新放回可处理路径。也正因为如此，Asynq 提供的是 at-least-once 语义：任务不会轻易丢，但在崩溃恢复边界上可能被再次执行，业务 Handler 需要保持幂等。
 
+### lease 如何续期：类似看门狗，但不是分布式锁
+
+在前面的 Processor 环节中我们看到他会调用这里的 Deque 函数，出队时写入的 `lease` 很容易被理解成分布式锁，但它更准确的含义是“任务处理权租约”。它不负责阻止其他任务入队，也不负责保证某类业务任务全局互斥；它只标记“某个具体 task ID 当前正在被某个 worker 处理，并且这个处理权什么时候过期”。
+
+租约的初始时间来自 `RDB.Dequeue`：
+
+```go
+const LeaseDuration = 30 * time.Second
+
+func (r *RDB) Dequeue(qnames ...string) (...) {
+    ...
+    leaseExpirationTime = r.clock.Now().Add(LeaseDuration)
+    argv := []interface{}{
+        leaseExpirationTime.Unix(),
+        base.TaskKeyPrefix(qname),
+    }
+    res, err := dequeueCmd.Run(context.Background(), r.client, keys, argv...).Result()
+    ...
+}
+```
+
+Lua 脚本会把这个过期时间写入 `lease` zset：
+
+```lua
+redis.call("HSET", key, "state", "active")
+redis.call("ZADD", KEYS[4], ARGV[1], id)
+```
+
+这表示任务被拿到后，Redis 中会有一条记录：
+
+```text
+asynq:{queue}:lease
+    member = task_id
+    score  = lease_expiration_unix
+```
+
+如果只有这一步，长任务超过 30 秒就会被误判为 lease 过期。Asynq 的做法是让 `heartbeater` 周期性续租。这个行为和常见的“看门狗续期”很像：worker 还活着，就不断把租约时间往后推；worker 崩溃或网络断开，续租停止，租约最终过期。
+
+`heartbeater.beat` 会维护当前活跃 worker 列表，只给 lease 仍然有效的任务续租：
+
+```go
+func (h *heartbeater) beat() {
+    ...
+    idsByQueue := make(map[string][]string)
+    for id, w := range h.workers {
+        ...
+        if w.lease.IsValid() {
+            idsByQueue[w.msg.Queue] = append(idsByQueue[w.msg.Queue], id)
+        } else {
+            w.lease.NotifyExpiration()
+        }
+    }
+
+    for qname, ids := range idsByQueue {
+        expirationTime, err := h.broker.ExtendLease(qname, ids...)
+        ...
+        for _, id := range ids {
+            if l := h.workers[id].lease; !l.Reset(expirationTime) {
+                ...
+            }
+        }
+    }
+}
+```
+
+Redis 侧的续租也很直接：把已有 lease zset member 的 score 更新为新的过期时间。
+
+```go
+func (r *RDB) ExtendLease(qname string, ids ...string) (expirationTime time.Time, err error) {
+    expireAt := r.clock.Now().Add(LeaseDuration)
+    var zs []redis.Z
+    for _, id := range ids {
+        zs = append(zs, redis.Z{Member: id, Score: float64(expireAt.Unix())})
+    }
+    err = r.client.ZAddXX(context.Background(), base.LeaseKey(qname), zs...).Err()
+    ...
+    return expireAt, nil
+}
+```
+
+这里使用 `ZAddXX`，含义是只更新已经存在的 lease，不新增不存在的 member。这样可以避免某些异常情况下重新“制造”出一个没有 active 任务对应的 lease。
+
+本地的 `Lease` 对象负责让 worker 感知租约是否还有效：
+
+```go
+type Lease struct {
+    once sync.Once
+    ch   chan struct{}
+
+    mu       sync.Mutex
+    expireAt time.Time
+}
+
+func (l *Lease) IsValid() bool {
+	now := l.Clock.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.expireAt.After(now) || l.expireAt.Equal(now)
+}
+
+func (l *Lease) Reset(expirationTime time.Time) bool {
+    if !l.IsValid() {
+        return false
+    }
+    ...
+    l.expireAt = expirationTime
+    return true
+}
+
+func (l *Lease) NotifyExpiration() bool {
+    if l.IsValid() {
+        return false
+    }
+    l.once.Do(l.closeCh)
+    return true
+}
+```
+
+processor 在执行任务时会监听这个 lease：
+
+```go
+select {
+case <-lease.Done():
+    cancel()
+    p.handleFailedMessage(ctx, lease, msg, ErrLeaseExpired)
+    return
+...
+}
+```
+
+因此，lease 机制有两条线同时存在：Redis 里的 lease zset 用于跨进程恢复，本地 `Lease` channel 用于通知当前 worker 停止处理。前者解决“其他 Server 如何知道这个任务已经没人续租”，后者解决“当前进程内的 worker 如何知道自己已经丢失处理权”。
+
+如果 worker 进程真的崩溃，heartbeater 不会再执行续租。`recoverer` 会周期性扫描早已过期的 lease：
+
+```go
+func (r *recoverer) recoverLeaseExpiredTasks() {
+    cutoff := time.Now().Add(-30 * time.Second)
+    msgs, err := r.broker.ListLeaseExpired(cutoff, r.queues...)
+    ...
+    for _, msg := range msgs {
+        if msg.Retried >= msg.Retry {
+            r.archive(msg, ErrLeaseExpired)
+        } else {
+            r.retry(msg, ErrLeaseExpired)
+        }
+    }
+}
+```
+
+这里用了 `now - 30s` 作为 cutoff，是为了给不同机器之间的时钟偏差留一点缓冲。也就是说，recoverer 不会在 lease 刚过期的一瞬间立刻抢回任务，而是等它“已经过期一段时间”后再处理。
+
+所以这套机制可以这样理解：
+
+```text
+Dequeue 时创建 30s lease
+    -> heartbeater 周期性续租，类似看门狗
+    -> worker 正常完成，Done/Retry/Archive 会删除 lease
+    -> worker 崩溃或续租失败，lease 过期
+    -> recoverer 扫描过期 lease，把任务转入 retry 或 archive
+```
+
+它和分布式锁的差别在于：lease 绑定的是某个具体任务的处理权，不是某类业务资源的全局互斥。如果业务要求“同一类周期任务绝不并发”，仍然需要使用 `Unique`、任务 `Timeout/Deadline`，或者在 Handler 内部加业务互斥。
+
 ### Handler 返回值决定任务如何收束
 
 用户注册的 Handler 看起来只是一个普通函数：
