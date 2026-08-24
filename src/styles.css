@@ -457,6 +457,37 @@ a {
   background: rgba(255, 253, 248, 0.54);
 }
 
+.article-content .table-wrap {
+  margin: 26px 0;
+  overflow-x: auto;
+}
+
+.article-content table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+.article-content th,
+.article-content td {
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.article-content th {
+  background: var(--surface-soft);
+  color: var(--ink);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.article-content tbody tr:nth-child(even) {
+  background: rgba(23, 32, 39, 0.03);
+}
+
 .article-content code {
   padding: 2px 6px;
   border-radius: 5px;

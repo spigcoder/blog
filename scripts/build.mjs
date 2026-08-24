@@ -19,16 +19,33 @@ const site = {
   categories: [
     {
       name: "开发内功",
-      href: "/blog/开发内功/",
+      dir: "os-internals",
+      href: "/blog/os-internals/",
       description: "计算机基础、工程能力、系统设计和长期可复用的技术积累。"
     },
     {
       name: "源码分析",
+      dir: "源码分析",
       href: "/blog/源码分析/",
       description: "从真实项目源码出发，拆解架构、关键路径和工程取舍。"
+    },
+    {
+      name: "tool",
+      dir: "tool",
+      href: "/blog/tool/",
+      description: "工具使用、开发环境与效率相关的实践记录。"
     }
   ]
 };
+
+function categoryDirOf(category) {
+  return category.dir || category.name;
+}
+
+function labelForDir(dir) {
+  const meta = site.categories.find((item) => (item.dir || item.name) === dir);
+  return meta ? meta.name : dir;
+}
 
 function escapeHtml(value = "") {
   return String(value)
@@ -341,6 +358,28 @@ function highlightCode(code, language = "") {
   return { html, lang };
 }
 
+function splitTableRow(line) {
+  return line.trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function isTableSeparator(line) {
+  return /^\s*\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$/.test(line);
+}
+
+function renderTable(headerLine, bodyLines) {
+  const headerCells = splitTableRow(headerLine);
+  const head = `<thead><tr>${headerCells.map((cell) => `<th>${inlineMarkdown(cell)}</th>`).join("")}</tr></thead>`;
+  const body = bodyLines.map((line) => {
+    const cells = splitTableRow(line);
+    return `<tr>${cells.map((cell) => `<td>${inlineMarkdown(cell)}</td>`).join("")}</tr>`;
+  }).join("");
+  return `<div class="table-wrap"><table>${head}<tbody>${body}</tbody></table></div>`;
+}
+
 function markdownToHtml(markdown) {
   const lines = markdown.split(/\r?\n/);
   const html = [];
@@ -365,7 +404,8 @@ function markdownToHtml(markdown) {
     listType = "";
   };
 
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     if (line.startsWith("```")) {
       if (inCode) {
         const highlighted = highlightCode(codeLines.join("\n"), codeLanguage);
@@ -436,6 +476,20 @@ function markdownToHtml(markdown) {
       continue;
     }
 
+    if (line.trim().startsWith("|") && isTableSeparator(lines[i + 1] || "")) {
+      flushParagraph();
+      flushList();
+      const bodyLines = [];
+      let j = i + 2; // 跳过表头下方的分隔行
+      while (j < lines.length && lines[j].trim().startsWith("|")) {
+        bodyLines.push(lines[j]);
+        j++;
+      }
+      html.push(renderTable(line, bodyLines));
+      i = j - 1;
+      continue;
+    }
+
     paragraph.push(line.trim());
   }
 
@@ -489,7 +543,7 @@ function layout({ title, description, body }) {
 function postCard(post) {
   return `<a class="post-card" href="/blog/${post.slug}/">
   <div>
-    <div class="meta">${post.dateText ? `<span>${post.dateText}</span>` : ""}<span>${escapeHtml(post.category)}</span></div>
+    <div class="meta">${post.dateText ? `<span>${post.dateText}</span>` : ""}<span>${escapeHtml(post.categoryLabel)}</span></div>
     <h3>${escapeHtml(post.title)}</h3>
     <p>${escapeHtml(post.excerpt)}</p>
   </div>
@@ -521,6 +575,7 @@ async function readPosts() {
     posts.push({
       slug,
       category,
+      categoryLabel: labelForDir(category),
       title,
       cover: data.cover || "",
       date: data.date || "",
@@ -545,24 +600,25 @@ async function build() {
 
   const latest = posts.slice(0, 4).map(postCard).join("\n");
   const groupedPosts = Map.groupBy(posts, (post) => post.category);
-  const knownCategoryNames = site.categories.map((category) => category.name);
-  const orderedCategoryNames = [
-    ...knownCategoryNames,
-    ...[...groupedPosts.keys()].filter((category) => !knownCategoryNames.includes(category))
+  const knownCategoryDirs = site.categories.map((category) => categoryDirOf(category));
+  const orderedCategoryDirs = [
+    ...knownCategoryDirs,
+    ...[...groupedPosts.keys()].filter((dir) => !knownCategoryDirs.includes(dir))
   ];
-  const categorySections = orderedCategoryNames.map((category) => {
-    const categoryPosts = groupedPosts.get(category) || [];
-    if (!categoryPosts.length && !knownCategoryNames.includes(category)) return "";
-    const categoryMeta = site.categories.find((item) => item.name === category);
+  const categorySections = orderedCategoryDirs.map((dir) => {
+    const categoryPosts = groupedPosts.get(dir) || [];
+    if (!categoryPosts.length && !knownCategoryDirs.includes(dir)) return "";
+    const categoryMeta = site.categories.find((item) => categoryDirOf(item) === dir);
+    const label = categoryMeta ? categoryMeta.name : dir;
     return `<section class="category-block">
     <div class="section-title">
       <div>
         <p class="section-kicker">${categoryPosts.length} 篇文章</p>
-        <h2>${escapeHtml(category)}</h2>
+        <h2>${escapeHtml(label)}</h2>
       </div>
       ${categoryMeta ? `<a href="${categoryMeta.href}">进入目录</a>` : ""}
     </div>
-    ${categoryPosts.length ? `<div class="post-grid">${categoryPosts.map(postCard).join("\n")}</div>` : `<p class="empty-state">这个目录还没有文章，之后可以把 Markdown 放到 <code>content/posts/${escapeHtml(category)}/</code>。</p>`}
+    ${categoryPosts.length ? `<div class="post-grid">${categoryPosts.map(postCard).join("\n")}</div>` : `<p class="empty-state">这个目录还没有文章，之后可以把 Markdown 放到 <code>content/posts/${escapeHtml(dir)}/</code>。</p>`}
   </section>`;
   }).join("\n");
 
@@ -605,19 +661,20 @@ async function build() {
   }));
 
   for (const category of site.categories) {
-    const categoryPosts = groupedPosts.get(category.name) || [];
-    const categoryDir = path.join(distDir, "blog", category.name);
-    await mkdir(categoryDir, { recursive: true });
+    const dirName = categoryDirOf(category);
+    const categoryPosts = groupedPosts.get(dirName) || [];
+    const categoryDirPath = path.join(distDir, "blog", dirName);
+    await mkdir(categoryDirPath, { recursive: true });
     const body = `<main class="section category-page">
   <header class="category-hero">
     <p class="section-kicker">目录</p>
     <h1>${escapeHtml(category.name)}</h1>
     <p>${escapeHtml(category.description)}</p>
   </header>
-  ${categoryPosts.length ? `<div class="post-grid">${categoryPosts.map(postCard).join("\n")}</div>` : `<p class="empty-state">这个目录还没有文章。把 Markdown 放到 <code>content/posts/${escapeHtml(category.name)}/</code> 后重新构建即可。</p>`}
+  ${categoryPosts.length ? `<div class="post-grid">${categoryPosts.map(postCard).join("\n")}</div>` : `<p class="empty-state">这个目录还没有文章。把 Markdown 放到 <code>content/posts/${escapeHtml(dirName)}/</code> 后重新构建即可。</p>`}
 </main>`;
 
-    await writeFile(path.join(categoryDir, "index.html"), layout({
+    await writeFile(path.join(categoryDirPath, "index.html"), layout({
       title: category.name,
       description: category.description,
       body
